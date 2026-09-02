@@ -102,6 +102,7 @@ let kickUsername = urlParams.get("kickUsername") || "";
 let youtubeUsername = urlParams.get("youtubeUsername") || "";
 
 const streamplaceProfileMap = new Map();
+const streamplaceBadgeRecordMap = new Map();
 const streamplaceMessageMap = new Map();
 const streamplaceMessagesByUri = new Map();
 const streamplaceJetstreamHosts = [
@@ -146,9 +147,11 @@ const ignoreUserList = ignoreChatters.split(',').map(item => item.trim().toLower
 switch (scrollDirection) {
 	case 1:
 		document.getElementById('messageList').classList.add('normalScrollDirection');
+		document.getElementById('mainContainer').classList.add('normalScrollDirection');
 		break;
 	case 2:
 		document.getElementById('messageList').classList.add('reverseScrollDirection');
+		document.getElementById('mainContainer').classList.add('reverseScrollDirection');
 		break;
 }
 
@@ -745,6 +748,7 @@ async function StreamplaceMessage(data) {
 	const avatarDiv = instance.querySelector("#avatar");
 	const timestampDiv = instance.querySelector("#timestamp");
 	const platformDiv = instance.querySelector("#platform");
+	const badgeListDiv = instance.querySelector("#badgeList");
 	const usernameDiv = instance.querySelector("#username");
 	const messageDiv = instance.querySelector("#message");
 
@@ -782,6 +786,20 @@ async function StreamplaceMessage(data) {
 			usernameDiv.innerText = profile.displayName || username;
 
 		usernameDiv.style.color = GetStreamplaceNameColor(profile);
+	}
+
+	if (showBadges) {
+		const badges = await GetStreamplaceBadges(profile, data.authorDid);
+		if (streamplaceMessageMap.get(data.messageKey) !== data.messageId)
+			return;
+		for (const badgeData of badges) {
+			const badge = new Image();
+			badge.src = badgeData.imageUrl;
+			badge.alt = badgeData.name;
+			badge.title = badgeData.description || badgeData.name;
+			badge.classList.add("badge");
+			badgeListDiv.appendChild(badge);
+		}
 	}
 
 	if (ContainsStreamplaceMention(message) && highlightMentions && showMessage)
@@ -852,6 +870,7 @@ async function StreamplaceMessage(data) {
 
 async function GetStreamplaceProfile(did) {
 	if (!streamplaceProfileMap.has(did)) {
+		const chatProfileRequest = GetStreamplaceChatProfile(did);
 		const profileRequest = Promise.all([
 			fetch(`https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`)
 				.then(response => {
@@ -859,13 +878,11 @@ async function GetStreamplaceProfile(did) {
 						throw new Error(`Could not load profile (${response.status}).`);
 					return response.json();
 				}),
-			fetch(`https://public.api.bsky.app/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}&collection=place.stream.chat.profile&rkey=self`)
-				.then(response => response.ok ? response.json() : null)
-				.catch(() => null)
+			chatProfileRequest
 		])
 			.then(([profile, chatProfile]) => ({
 				...profile,
-				chatProfile: chatProfile?.value || null
+				chatProfile: chatProfile
 			}))
 			.catch(error => {
 				console.warn(`Unable to load Streamplace profile for ${did}`, error);
@@ -876,6 +893,118 @@ async function GetStreamplaceProfile(did) {
 	}
 
 	return streamplaceProfileMap.get(did);
+}
+
+async function GetStreamplaceChatProfile(did) {
+	try {
+		const params = new URLSearchParams({
+			repo: did,
+			collection: "place.stream.chat.profile",
+			rkey: "self"
+		});
+		const response = await fetch(`https://slingshot.microcosm.blue/xrpc/com.atproto.repo.getRecord?${params}`);
+		if (!response.ok)
+			return null;
+
+		const record = await response.json();
+		return record.value || null;
+	}
+	catch (error) {
+		console.warn(`Unable to load Streamplace chat profile for ${did}`, error);
+		return null;
+	}
+}
+
+async function GetStreamplaceBadges(profile, authorDid) {
+	const badges = [];
+	if (authorDid === streamplaceStreamerDid)
+		badges.push(GetStreamplaceBuiltInBadge("streamer"));
+	if (profile.chatProfile?.selfLabels?.includes("bot"))
+		badges.push(GetStreamplaceBuiltInBadge("bot"));
+
+	const selections = profile.chatProfile?.badges;
+	const streamerSelection = selections?.streamer?.find(selection => selection.streamer === streamplaceStreamerDid);
+	if (streamerSelection?.badge?.uri) {
+		const badge = await ResolveStreamplaceIssuedBadge(streamerSelection.badge.uri, authorDid);
+		if (badge?.badgeType === "place.stream.badge.defs#vip")
+			badges.push(badge);
+	}
+
+	if (selections?.global?.uri) {
+		const badge = await ResolveStreamplaceIssuedBadge(selections.global.uri, authorDid);
+		const globalIssuers = [
+			"did:plc:2zmxikig2sj7gqaezl5gntae",
+			"did:plc:k644h4rq5bjfzcetgsa6tuby",
+			"did:plc:rbvrr34edl5ddpuwcubjiost"
+		];
+		if (badge && globalIssuers.includes(badge.issuer))
+			badges.push(badge);
+	}
+
+	return badges.filter(Boolean).slice(0, 3);
+}
+
+function GetStreamplaceBuiltInBadge(type) {
+	const badgeNames = {
+		streamer: "Streamer",
+		vip: "VIP",
+		bot: "Bot"
+	};
+	const badgeFiles = {
+		streamer: "live",
+		vip: "vip",
+		bot: "robot"
+	};
+	return {
+		name: badgeNames[type],
+		imageUrl: `https://raw.githubusercontent.com/streamplace/streamplace/next/js/components/assets/badges/${badgeFiles[type]}_2x.png`
+	};
+}
+
+async function ResolveStreamplaceIssuedBadge(issuanceUri, authorDid) {
+	try {
+		const issuance = await GetStreamplaceRecordByUri(issuanceUri);
+		if (issuance?.value?.did !== authorDid || !issuance.value.badge?.uri)
+			return null;
+
+		const definition = await GetStreamplaceRecordByUri(issuance.value.badge.uri);
+		if (!definition?.value)
+			return null;
+
+		const issuer = issuanceUri.split("/")[2];
+		const definitionIssuer = definition.uri.split("/")[2];
+		const imageCid = definition.value.image?.ref?.$link;
+		const isVip = definition.value.badgeType === "place.stream.badge.defs#vip";
+		if (!imageCid && !isVip)
+			return null;
+
+		return {
+			badgeType: definition.value.badgeType,
+			issuer: issuer,
+			name: definition.value.name || "Streamplace badge",
+			description: definition.value.description || "",
+			imageUrl: imageCid ? `https://cdn.bsky.app/img/feed_fullsize/plain/${definitionIssuer}/${imageCid}@png` : GetStreamplaceBuiltInBadge("vip").imageUrl
+		};
+	}
+	catch (error) {
+		console.warn(`Unable to resolve Streamplace badge ${issuanceUri}`, error);
+		return null;
+	}
+}
+
+async function GetStreamplaceRecordByUri(uri) {
+	if (!streamplaceBadgeRecordMap.has(uri)) {
+		const params = new URLSearchParams({ at_uri: uri });
+		const request = fetch(`https://slingshot.microcosm.blue/xrpc/blue.microcosm.repo.getRecordByUri?${params}`)
+			.then(response => {
+				if (!response.ok)
+					throw new Error(`Could not load record (${response.status}).`);
+				return response.json();
+			});
+		streamplaceBadgeRecordMap.set(uri, request);
+	}
+
+	return streamplaceBadgeRecordMap.get(uri);
 }
 
 function GetStreamplaceNameColor(profile) {
