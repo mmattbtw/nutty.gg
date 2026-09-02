@@ -1,6 +1,6 @@
 const widgetContainer = document.getElementById('widgetContainer');
 
-const settingsPageURL = '/.common/core/settings-core';
+const settingsPageURL = new URL('../../.common/core/settings-core/', window.location.href).href;
 
 const currentURL = window.location.href;
 
