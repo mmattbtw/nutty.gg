@@ -369,6 +369,22 @@
 			"group": "Which YouTube messages do you want to see?"
 		},
 		{
+			"id": "streamplaceStreamer",
+			"label": "Streamer",
+			"description": "Streamplace handle, DID, or profile URL. Leave blank to disable Streamplace chat.",
+			"type": "text",
+			"defaultValue": "",
+			"group": "Streamplace"
+		},
+		{
+			"id": "showStreamplaceMessages",
+			"label": "Chat Messages",
+			"description": "",
+			"type": "checkbox",
+			"defaultValue": true,
+			"group": "Streamplace"
+		},
+		{
 			"id": "showKickMessages",
 			"label": "Chat Messages",
 			"description": "",

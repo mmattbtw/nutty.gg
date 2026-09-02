@@ -69,6 +69,9 @@ const showYouTubeSuperChats = GetBooleanParam("showYouTubeSuperChats", true);
 const showYouTubeSuperStickers = GetBooleanParam("showYouTubeSuperStickers", true);
 const showYouTubeMemberships = GetBooleanParam("showYouTubeMemberships", true);
 
+const streamplaceStreamer = urlParams.get("streamplaceStreamer") || "";
+const showStreamplaceMessages = GetBooleanParam("showStreamplaceMessages", true);
+
 const enableTikTokSupport = GetBooleanParam("enableTikTokSupport", false);
 const showTikTokFollows = GetBooleanParam("showTikTokFollows", false);
 const showTikTokLikes = GetBooleanParam("showTikTokLikes", false);
@@ -97,6 +100,22 @@ const youtubeCustomSubIcon = urlParams.get("youtubeCustomSubIcon") || "";
 let twitchUsername = urlParams.get("twitchUsername") || "";
 let kickUsername = urlParams.get("kickUsername") || "";
 let youtubeUsername = urlParams.get("youtubeUsername") || "";
+
+const streamplaceProfileMap = new Map();
+const streamplaceMessageMap = new Map();
+const streamplaceMessagesByUri = new Map();
+const streamplaceJetstreamHosts = [
+	"jetstream2.us-east.bsky.network",
+	"jetstream1.us-east.bsky.network",
+	"jetstream2.us-west.bsky.network",
+	"jetstream1.us-west.bsky.network"
+];
+let streamplaceStreamerDid = "";
+let streamplaceStreamerHandle = "";
+let streamplaceJetstream = null;
+let streamplaceJetstreamHostIndex = 0;
+let streamplaceReconnectDelay = 1000;
+let streamplaceShouldReconnect = true;
 
 
 
@@ -558,6 +577,351 @@ function TikfinityConnect() {
 
 // Try connect when window is loaded
 window.addEventListener('load', TikfinityConnect);
+
+
+
+/////////////////////////
+// STREAMPLACE CLIENT  //
+/////////////////////////
+
+async function InitializeStreamplace() {
+	if (!showStreamplaceMessages || !streamplaceStreamer)
+		return;
+
+	try {
+		streamplaceStreamerDid = await ResolveStreamplaceStreamer(streamplaceStreamer);
+		const streamerProfile = await GetStreamplaceProfile(streamplaceStreamerDid);
+		streamplaceStreamerHandle = streamerProfile.handle || "";
+		console.log(`Connecting to Streamplace chat for ${streamplaceStreamerDid}`);
+		ConnectStreamplaceJetstream();
+	}
+	catch (error) {
+		console.error(`Unable to connect to Streamplace chat for "${streamplaceStreamer}"`, error);
+	}
+}
+
+async function ResolveStreamplaceStreamer(streamer) {
+	let identifier = streamer.trim();
+
+	try {
+		const profileUrl = new URL(identifier);
+		if (profileUrl.hostname === "stream.place" || profileUrl.hostname.endsWith(".stream.place"))
+			identifier = profileUrl.pathname.split("/").filter(Boolean)[0] || "";
+	}
+	catch {
+		// The setting is a handle or DID, not a URL.
+	}
+
+	identifier = identifier.replace(/^@/, "");
+	if (!identifier)
+		throw new Error("The Streamplace streamer setting is empty.");
+
+	if (identifier.startsWith("did:"))
+		return identifier;
+
+	const response = await fetch(`https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(identifier)}`);
+	if (!response.ok)
+		throw new Error(`Could not resolve Streamplace handle (${response.status}).`);
+
+	const data = await response.json();
+	if (!data.did)
+		throw new Error("The handle resolver did not return a DID.");
+
+	return data.did;
+}
+
+function ConnectStreamplaceJetstream() {
+	const host = streamplaceJetstreamHosts[streamplaceJetstreamHostIndex % streamplaceJetstreamHosts.length];
+	const endpoint = `wss://${host}/subscribe?wantedCollections=place.stream.chat.message`;
+
+	try {
+		streamplaceJetstream = new WebSocket(endpoint);
+	}
+	catch (error) {
+		console.error(`Unable to open Streamplace Jetstream through ${host}`, error);
+		ScheduleStreamplaceReconnect();
+		return;
+	}
+
+	streamplaceJetstream.onopen = () => {
+		streamplaceReconnectDelay = 1000;
+		console.log(`Streamplace chat connected through ${host}`);
+	};
+
+	streamplaceJetstream.onmessage = (event) => {
+		try {
+			HandleStreamplaceJetstreamEvent(JSON.parse(event.data));
+		}
+		catch (error) {
+			console.error("Unable to process a Streamplace chat event", error);
+		}
+	};
+
+	streamplaceJetstream.onerror = (error) => {
+		console.error(`Streamplace Jetstream error from ${host}`, error);
+	};
+
+	streamplaceJetstream.onclose = ScheduleStreamplaceReconnect;
+}
+
+function ScheduleStreamplaceReconnect() {
+	if (!streamplaceShouldReconnect)
+		return;
+
+	streamplaceJetstreamHostIndex++;
+	setTimeout(ConnectStreamplaceJetstream, streamplaceReconnectDelay);
+	streamplaceReconnectDelay = Math.min(Math.round(streamplaceReconnectDelay * 1.5), 15000);
+}
+
+function HandleStreamplaceJetstreamEvent(event) {
+	if (event.kind !== "commit" || !event.commit)
+		return;
+
+	const commit = event.commit;
+	if (commit.collection !== "place.stream.chat.message")
+		return;
+
+	const messageKey = `${event.did}/${commit.rkey}`;
+	const messageUri = `at://${event.did}/place.stream.chat.message/${commit.rkey}`;
+
+	if (commit.operation === "delete") {
+		const messageId = streamplaceMessageMap.get(messageKey);
+		if (messageId)
+			RemoveStreamplaceMessage(messageId);
+
+		streamplaceMessageMap.delete(messageKey);
+		streamplaceMessagesByUri.delete(messageUri);
+		return;
+	}
+
+	if (commit.operation !== "create" || commit.record?.streamer !== streamplaceStreamerDid)
+		return;
+
+	const messageId = `streamplace-${event.did}-${commit.rkey}`;
+	streamplaceMessageMap.set(messageKey, messageId);
+	streamplaceMessagesByUri.set(messageUri, {
+		authorDid: event.did,
+		text: commit.record.text || ""
+	});
+
+	if (streamplaceMessageMap.size > 1000) {
+		const oldestKey = streamplaceMessageMap.keys().next().value;
+		streamplaceMessageMap.delete(oldestKey);
+	}
+
+	if (streamplaceMessagesByUri.size > 1000) {
+		const oldestUri = streamplaceMessagesByUri.keys().next().value;
+		streamplaceMessagesByUri.delete(oldestUri);
+	}
+
+	StreamplaceMessage({
+		authorDid: event.did,
+		messageId: messageId,
+		messageKey: messageKey,
+		record: commit.record
+	});
+}
+
+async function StreamplaceMessage(data) {
+	let message = data.record.text || "";
+	if (message.startsWith("!") && excludeCommands)
+		return;
+
+	const profile = await GetStreamplaceProfile(data.authorDid);
+	if (streamplaceMessageMap.get(data.messageKey) !== data.messageId)
+		return;
+
+	const username = profile.handle || data.authorDid;
+	if (ignoreUserList.includes(username.toLowerCase()) || ignoreUserList.includes((profile.displayName || "").toLowerCase()))
+		return;
+
+	const template = document.getElementById('messageTemplate');
+	const instance = template.content.cloneNode(true);
+	const messageContainerDiv = instance.querySelector("#messageContainer");
+	const replyDiv = instance.querySelector("#reply");
+	const replyUserDiv = instance.querySelector("#replyUser");
+	const replyMsgDiv = instance.querySelector("#replyMsg");
+	const userInfoDiv = instance.querySelector("#userInfo");
+	const avatarDiv = instance.querySelector("#avatar");
+	const timestampDiv = instance.querySelector("#timestamp");
+	const platformDiv = instance.querySelector("#platform");
+	const usernameDiv = instance.querySelector("#username");
+	const messageDiv = instance.querySelector("#message");
+
+	if (useChatBubbles) {
+		const opacity255 = Math.round(parseFloat(bubbleOpacity) * 255);
+		let hexOpacity = opacity255.toString(16);
+		if (hexOpacity.length < 2)
+			hexOpacity = "0" + hexOpacity;
+
+		document.documentElement.style.setProperty('--bubble-color', `${bubbleColor}${hexOpacity}`);
+		messageContainerDiv.classList.add("bubble");
+	}
+
+	const replyUri = data.record.reply?.parent?.uri || data.record.reply?.root?.uri;
+	const replyMessage = streamplaceMessagesByUri.get(replyUri);
+	if (replyMessage && showMessage) {
+		const replyProfile = await GetStreamplaceProfile(replyMessage.authorDid);
+		if (streamplaceMessageMap.get(data.messageKey) !== data.messageId)
+			return;
+
+		replyDiv.style.display = 'block';
+		replyUserDiv.innerText = replyProfile.displayName || replyProfile.handle || replyMessage.authorDid;
+		replyMsgDiv.innerText = replyMessage.text;
+	}
+
+	if (showTimestamps) {
+		timestampDiv.classList.add("timestamp");
+		timestampDiv.innerText = GetStreamplaceTimeFormatted(data.record.createdAt);
+	}
+
+	if (showUsername) {
+		if (profile.displayName && profile.displayName.toLowerCase() !== username.toLowerCase())
+			usernameDiv.innerText = `${profile.displayName} (${username})`;
+		else
+			usernameDiv.innerText = profile.displayName || username;
+
+		usernameDiv.style.color = GetStreamplaceNameColor(profile);
+	}
+
+	if (ContainsStreamplaceMention(message) && highlightMentions && showMessage)
+		messageContainerDiv.classList.add("highlightMessage");
+
+	if (furryMode)
+		message = TranslateToFurry(message);
+
+	if (showMessage)
+		messageDiv.innerText = message;
+
+	if (inlineChat) {
+		instance.querySelector("#colon-separator").style.display = `inline`;
+		instance.querySelector("#line-space").style.display = `none`;
+		instance.querySelector(".message-contents").style.alignItems = 'center';
+	}
+
+	if (showPlatform)
+		platformDiv.innerHTML = `<img src="icons/platforms/streamplace.svg" class="platform"/>`;
+
+	if (showAvatar && profile.avatar) {
+		const avatar = new Image();
+		avatar.src = profile.avatar;
+		avatar.classList.add("avatar");
+		avatarDiv.appendChild(avatar);
+	}
+
+	const messageList = document.getElementById("messageList");
+	if (groupConsecutiveMessages && messageList.children.length > 0 && scrollDirection != 2) {
+		const lastPlatform = messageList.lastChild.dataset.platform;
+		const lastUserId = messageList.lastChild.dataset.userId;
+		if (lastPlatform == "streamplace" && lastUserId == data.authorDid) {
+			userInfoDiv.style.display = "none";
+			avatarDiv.style.visibility = "hidden";
+			avatarDiv.style.height = "0px";
+		}
+	}
+
+	if (IsThisUserAllowedToPostImagesOrNotReturnTrueIfTheyCanReturnFalseIfTheyCannot(imageEmbedPermissionLevel, data, 'streamplace') && IsImageUrl(message)) {
+		const image = new Image();
+		image.onload = function () {
+			if (streamplaceMessageMap.get(data.messageKey) !== data.messageId)
+				return;
+
+			image.style.padding = "20px 0px";
+			image.style.width = "100%";
+			messageDiv.innerHTML = '';
+			messageDiv.appendChild(image);
+			AddMessageItem(instance, data.messageId, 'streamplace', data.authorDid);
+		};
+
+		const urlObj = new URL(message);
+		urlObj.search = '';
+		urlObj.hash = '';
+		image.src = "https://external-content.duckduckgo.com/iu/?u=" + urlObj.toString();
+	}
+	else {
+		AddMessageItem(instance, data.messageId, 'streamplace', data.authorDid);
+	}
+
+	if (youtubeRegex.test(message)) {
+		const videoId = ExtractYouTubeVideoId(message);
+		const videoData = await GetYouTubeVideoData(videoId);
+		if (videoData)
+			YouTubeThumbnailPreview(videoData);
+	}
+}
+
+async function GetStreamplaceProfile(did) {
+	if (!streamplaceProfileMap.has(did)) {
+		const profileRequest = Promise.all([
+			fetch(`https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`)
+				.then(response => {
+					if (!response.ok)
+						throw new Error(`Could not load profile (${response.status}).`);
+					return response.json();
+				}),
+			fetch(`https://public.api.bsky.app/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}&collection=place.stream.chat.profile&rkey=self`)
+				.then(response => response.ok ? response.json() : null)
+				.catch(() => null)
+		])
+			.then(([profile, chatProfile]) => ({
+				...profile,
+				chatProfile: chatProfile?.value || null
+			}))
+			.catch(error => {
+				console.warn(`Unable to load Streamplace profile for ${did}`, error);
+				return { did: did, handle: did, displayName: did, avatar: "", chatProfile: null };
+			});
+
+		streamplaceProfileMap.set(did, profileRequest);
+	}
+
+	return streamplaceProfileMap.get(did);
+}
+
+function GetStreamplaceNameColor(profile) {
+	const color = profile.chatProfile?.color;
+	if (color)
+		return `rgb(${color.red}, ${color.green}, ${color.blue})`;
+
+	return RandomHex(profile.handle || profile.did);
+}
+
+function GetStreamplaceTimeFormatted(createdAt) {
+	const date = new Date(createdAt);
+	if (isNaN(date.getTime()))
+		return GetCurrentTimeFormatted();
+
+	let hours = date.getHours();
+	const minutes = String(date.getMinutes()).padStart(2, '0');
+	const ampm = hours >= 12 ? 'PM' : 'AM';
+	hours = hours % 12 || 12;
+	return `${hours}:${minutes} ${ampm}`;
+}
+
+function ContainsStreamplaceMention(message) {
+	if (!streamplaceStreamerHandle)
+		return false;
+
+	const escapedHandle = streamplaceStreamerHandle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return new RegExp(`(^|\\s)@${escapedHandle}(\\s|$)`, 'i').test(message);
+}
+
+function RemoveStreamplaceMessage(messageId) {
+	const item = document.getElementById(messageId);
+	if (!item)
+		return;
+
+	item.style.opacity = 0;
+	item.style.maxHeight = 0;
+	setTimeout(() => item.remove(), 1000);
+}
+
+window.addEventListener('load', InitializeStreamplace);
+window.addEventListener('beforeunload', () => {
+	streamplaceShouldReconnect = false;
+	if (streamplaceJetstream)
+		streamplaceJetstream.close();
+});
 
 
 
@@ -3288,6 +3652,8 @@ function GetPermissionLevel(data, platform) {
 				return 15;
 			else
 				return 10;
+		case 'streamplace':
+			return data.authorDid === streamplaceStreamerDid ? 40 : 10;
 	}
 }
 
