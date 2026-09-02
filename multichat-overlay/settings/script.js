@@ -1,23 +1,17 @@
 const widgetContainer = document.getElementById('widgetContainer');
 
-const settingsPageURL = new URL('../../.common/core/settings-core/', window.location.href).href;
-
 const currentURL = window.location.href;
-
-let settingsJSON;
-let baseURL = currentURL;
-
-if (baseURL.endsWith("index.html"))
-    baseURL = baseURL.replace("index.html", "");
-
-settingsJSON = "?settingsJson=" + baseURL + "settings.json";
-
-const lastSlashIndex = baseURL.lastIndexOf("/");
-let widgetURL = "&widgetURL=" + baseURL.replace("/settings", "");
+const baseURL = new URL('./', currentURL);
+const settingsJSON = new URL('settings.json', baseURL);
+const widgetURL = new URL('../', baseURL);
+const settingsPageURL = new URL('../../.common/core/settings-core/', baseURL);
+settingsPageURL.searchParams.set('v', '2');
+settingsPageURL.searchParams.set('settingsJson', settingsJSON.href);
+settingsPageURL.searchParams.set('widgetURL', widgetURL.href);
 
 console.debug("Window Ref: " + window.location.href);
-console.debug("Base URL: " + baseURL);
-console.debug("Settings JSON: " + settingsJSON);
-console.debug("Widget URL: " + widgetURL);
+console.debug("Base URL: " + baseURL.href);
+console.debug("Settings JSON: " + settingsJSON.href);
+console.debug("Widget URL: " + widgetURL.href);
 
-widgetContainer.src = settingsPageURL + settingsJSON + widgetURL;
+widgetContainer.src = settingsPageURL.href;
